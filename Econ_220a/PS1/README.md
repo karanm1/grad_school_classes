@@ -11,7 +11,8 @@ The code is written in python and assumes that your device has python installed.
 - Econ_220a_PS1.pdf has the written answers
 
 ## Instructions
-Run the following commands in sequence in Command Prompt/Terminal to create the virtual environment, install the required packages, and run the full file.
+- Extract the folder from the zip file
+- Run the following commands in sequence in Command Prompt/Terminal to create the virtual environment, install the required packages, and run the full file.
 
 Windows
 1. Open Command Prompt or Powershell and set cd to this folder.
