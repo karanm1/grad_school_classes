@@ -1791,9 +1791,36 @@ def nested_logit_merged_pricing_algorithm(alpha, rho, mc_dict, products, merged_
         
         utilities = np.array(utilities)
         
-        # Calculate market shares: s_j = u_j / sum_i(u_i)
-        shares = np.exp(utilities) / (np.sum(np.exp(utilities)) + 1)
-        market_shares = shares
+        # Calculate nested logit market shares using proper algorithm
+        # Based on the nested logit structure with conditional and group shares
+        
+        # Get unique nests and create inverse index
+        unique_nests = np.unique(nests)
+        inv_idx = np.array([np.where(unique_nests == nest)[0][0] for nest in nests])
+        
+        # Initialize arrays
+        conditional_shares = np.zeros(len(utilities))
+        inclusive_vals = np.zeros(len(unique_nests))
+        
+        # Calculate denom_exp_power = 1 - rho
+        nest_scaling = 1 - rho
+        
+        # Calculate conditional shares within each nest
+        for i, nest in enumerate(unique_nests):
+            in_nest = (inv_idx == i)
+            u = utilities[in_nest]
+            scaled = u / nest_scaling
+            exp_args = np.exp(scaled)
+            sum_exp = exp_args.sum()
+            
+            conditional_shares[in_nest] = exp_args / sum_exp
+            inclusive_vals[i] = sum_exp ** nest_scaling
+        
+        # Calculate group shares and final product shares
+        denom = 1.0 + inclusive_vals.sum()  # +1 for outside option
+        group_shares = inclusive_vals / denom
+        market_shares = conditional_shares * group_shares[inv_idx]
+        outside_share = 1.0 / denom
         
         # Calculate share_in_nest for each product
         share_in_nest = []
@@ -1803,34 +1830,52 @@ def nested_logit_merged_pricing_algorithm(alpha, rho, mc_dict, products, merged_
             nest_total_share = sum(market_shares[j] for j in range(len(products)) if nests[j] == nest)
             share_in_nest.append(market_shares[i] / nest_total_share)
         
-        # Calculate new prices
-        new_prices = np.zeros(len(products))
+        # Vectorized approach for calculating new prices
+        n_products = len(products)
+        new_prices = np.zeros(n_products)
         
-        for i, product in enumerate(products):
-            mc_j = mc_dict[product]
-            s_j = market_shares[i]
-            s_in_nest_j = share_in_nest[i]
+        # Convert to numpy arrays for vectorized operations
+        mc_array = np.array([mc_dict[product] for product in products])
+        s_array = np.array(market_shares)
+        s_in_nest_array = np.array(share_in_nest)
+        
+        # Create merged product mask
+        merged_mask = np.array([product in merged_products for product in products])
+        merged_indices = np.where(merged_mask)[0]
+        
+        if len(merged_indices) == 2:
+            # Handle merged products using matrix approach
+            j_idx, k_idx = merged_indices[0], merged_indices[1]
             
-            if product in merged_products:
+            # Get values for merged products
+            mc_j, mc_k = mc_array[j_idx], mc_array[k_idx]
+            s_j, s_k = s_array[j_idx], s_array[k_idx]
+            s_in_nest_j, s_in_nest_k = s_in_nest_array[j_idx], s_in_nest_array[k_idx]
+            
+            # Calculate partial derivatives for Delta matrix
+            # Own-price derivatives: α * s_j / (1-rho) * (1 - rho*s_jg - (1 - rho) * s_j)
+            a = alpha * s_j / (1 - rho) * (1 - rho * s_in_nest_j - (1 - rho) * s_j)
+            d = alpha * s_k / (1 - rho) * (1 - rho * s_in_nest_k - (1 - rho) * s_k)
+            
+            # Cross-price derivatives: α * s_j / (1-rho) * (-rho*s_jg - (1 - rho) * s_j)
+            b = alpha * s_j / (1 - rho) * (-rho * s_in_nest_k - (1 - rho) * s_k)
+            c = alpha * s_k / (1 - rho) * (-rho * s_in_nest_j - (1 - rho) * s_j)
+        
+            # Calculate determinant
+            det = a * d - b * c
                 
-                # Find the other merged product
-                other_merged = [p for p in merged_products if p != product][0]
-                other_idx = products.index(other_merged)
-                
-                p_other = prices[other_idx]
-                mc_other = mc_dict[other_merged]
-                s_other = market_shares[other_idx]
-                s_in_nest_other = share_in_nest[other_idx]
-                
-                # Calculate the merged product price
-                denominator = alpha * (1 - rho * s_in_nest_j - (1 - rho) * s_j)
-                cross_numerator = alpha * (p_other - mc_other) * (rho * s_in_nest_other + (1 - rho) * s_other)
-                
-                new_prices[i] = mc_j + ((1-rho) + cross_numerator) / denominator
-                
-            else:
-                denominator = alpha * (1 - rho * s_in_nest_j - (1 - rho) * s_j)
-                new_prices[i] = mc_j + (1 - rho) / denominator
+            # Calculate new prices using explicit formulas:
+            # p_j = mc_j + (1/(ad-bc)) * (ds_j - bs_k)
+            # p_k = mc_k + (1/(ad-bc)) * (-cs_j + as_k)
+            new_prices[j_idx] = mc_j + (1 / det) * (d * s_j - b * s_k)
+            new_prices[k_idx] = mc_k + (1 / det) * (-c * s_j + a * s_k)
+        
+        # Handle non-merged products using vectorized operations
+        non_merged_mask = ~merged_mask
+        if np.any(non_merged_mask):
+            # Non-merged product formula: p_j = mc_j + (1-ρ) / (α(1 - ρs_{j|g} - (1-ρ)s_j))
+            denominator = alpha * (1 - rho * s_in_nest_array[non_merged_mask] - (1 - rho) * s_array[non_merged_mask])
+            new_prices[non_merged_mask] = mc_array[non_merged_mask] + (1 - rho) / denominator
         
         prices = new_prices
         
@@ -1921,8 +1966,8 @@ rho_welfare = coef_share_nest  # Coefficient on share_in_nest
 def calculate_nested_consumer_surplus(prices, alpha, rho, product_fe_coeffs, city_fe, period_fe, products, nests):
     """
     Calculate consumer surplus using the nested logit inclusive value formula:
-    CS = ln(Sum(exp(u_j))) * (1/alpha)
-    where u_j includes all products (0 to 5) including outside option (u_0 = 0)
+    CS = ln(1 + Sum_nests(Sum_withinnest(exp(u/(1-rho)))^(1-rho))) * (1/alpha)
+    where outside option is handled with the "1+" approach
     """
     
     # Calculate utilities for all products
@@ -1934,12 +1979,21 @@ def calculate_nested_consumer_surplus(prices, alpha, rho, product_fe_coeffs, cit
         u_j = intercept + alpha * negprice + product_fe + city_fe + period_fe + xi_j
         utilities.append(u_j)
     
-    # Add outside option (u_0 = 0)
-    utilities.append(0.0)
+    # Get unique nests
+    unique_nests = np.unique(nests)
     
-    # Calculate inclusive value: ln(Sum(exp(u_j))) * (1/alpha)
-    sum_exp_utilities = np.sum(np.exp(utilities))
-    inclusive_value = np.log(sum_exp_utilities) * (1 / alpha)
+    # Calculate inclusive values for each nest
+    inclusive_values = []
+    for nest in unique_nests:
+        # Select products in this nest
+        nest_utilities = [utilities[i] for i in range(len(products)) if nests[i] == nest]
+        # Calculate inclusive value for this nest: Sum(exp(u/(1-rho)))
+        iv_nest = np.sum([np.exp(u / (1 - rho)) for u in nest_utilities])
+        inclusive_values.append(iv_nest ** (1 - rho))
+    
+    # Calculate consumer surplus: ln(1 + Sum(iv^(1-rho))) / alpha
+    sum_terms = np.sum(inclusive_values)
+    inclusive_value = np.log(1 + sum_terms) / alpha
     
     return inclusive_value
 
